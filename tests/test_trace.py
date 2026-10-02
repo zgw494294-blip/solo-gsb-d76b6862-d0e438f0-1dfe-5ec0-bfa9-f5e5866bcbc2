@@ -58,11 +58,11 @@ def unpack(parent, child, at="2026-09-01T00:00:00Z"):
     return {"action": "unpack", "parent_scan": parent, "child_scan": child, "occurred_at": at}
 
 
-def post(scans, rules, events, expected=200):
-    resp = client.post(
-        "/v1/recall/location-trace",
-        json={"scans": scans, "rules": rules, "events": events},
-    )
+def post(scans, rules, events, expected=200, contact_until=None):
+    payload: dict = {"scans": scans, "rules": rules, "events": events}
+    if contact_until is not None:
+        payload["contact_until"] = contact_until
+    resp = client.post("/v1/recall/location-trace", json=payload)
     assert resp.status_code == expected, resp.text
     return resp.json()
 
@@ -554,9 +554,255 @@ def test_event_errors_sorted_by_original_index():
     assert [e["index"] for e in body["errors"]] == [0, 1, 2]
 
 
+# ---------- contact_until:同地共处统计 ----------
+
+
+HIT = scan(GTIN3, "HIT")
+MISS1 = scan(GTIN2, "MISS1")
+MISS2 = scan(GTIN4, "MISS2")
+RULE_HIT = rule("R1", gtin=GTIN3)
+
+
+def _contact_rows(body):
+    return [
+        (
+            c["missed_item"]["serial"],
+            c["hit_item"]["serial"],
+            c["location"],
+            c["start_time"],
+            c["end_time"],
+        )
+        for c in body["contacts"]
+    ]
+
+
+def test_contacts_absent_without_contact_until():
+    events = [
+        transfer(MISS1, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(HIT, "2026-09-01T00:01:00Z", "WH-A"),
+    ]
+    body = post([HIT, MISS1], [RULE_HIT], events)
+    assert "contacts" not in body
+    assert body["items"] == [
+        {"gtin": GTIN3, "serial": "HIT", "locations": ["WH-A"], "rule_ids": ["R1"]}
+    ]
+
+
+def test_contact_until_must_carry_timezone():
+    events = [transfer(HIT, "2026-09-01T00:00:00Z", "WH-A")]
+    resp = client.post(
+        "/v1/recall/location-trace",
+        json={
+            "scans": [HIT],
+            "rules": [RULE_HIT],
+            "events": events,
+            "contact_until": "2026-09-01T01:00:00",
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_contact_until_before_latest_event_returns_422():
+    events = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(HIT, "2026-09-01T05:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    # 早于最晚事件(可带非 UTC 时区),整单 422
+    resp = client.post(
+        "/v1/recall/location-trace",
+        json={
+            "scans": [HIT],
+            "rules": [RULE_HIT],
+            "events": events,
+            "contact_until": "2026-09-01T12:30:00+08:00",  # UTC 04:30 < 05:00
+        },
+    )
+    assert resp.status_code == 422
+    assert "contact_until" in resp.json()["detail"]
+    # 恰好等于最晚事件时刻合法(左闭右开,无正时长共处时为空)
+    body = post([HIT], [RULE_HIT], events, contact_until="2026-09-01T05:00:00Z")
+    assert body["contacts"] == []
+
+
+def test_contacts_basic_direct_overlap_and_utc_output():
+    events = [
+        transfer(MISS1, "2026-09-01T00:02:00Z", "WH-A"),
+        transfer(HIT, "2026-09-01T00:01:00Z", "WH-A"),
+        transfer(HIT, "2026-09-01T02:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    body = post(
+        [HIT, MISS1], [RULE_HIT], events, contact_until="2026-09-01T03:00:00Z"
+    )
+    # 共处自较晚到达的 00:02 起(00:01 时 MISS1 持有人未知),HIT 离开时闭合
+    assert _contact_rows(body) == [
+        ("MISS1", "HIT", "WH-A", "2026-09-01T00:02:00Z", "2026-09-01T02:00:00Z")
+    ]
+
+
+def test_contacts_same_instant_all_events_applied_first():
+    # 同刻事件先全部处理:同刻到达 WH-A 即共处,段从该刻开始
+    events = [
+        transfer(MISS1, "2026-09-01T08:00:00+08:00", "WH-A"),
+        transfer(HIT, "2026-09-01T08:00:00+08:00", "WH-A"),
+    ]
+    body = post(
+        [HIT, MISS1], [RULE_HIT], events, contact_until="2026-09-01T09:00:00+08:00"
+    )
+    assert _contact_rows(body) == [
+        ("MISS1", "HIT", "WH-A", "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z")
+    ]
+    # 同刻先后到达不同地点:本组全部处理后才评估,不产生零时长段
+    events2 = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS1, "2026-09-01T00:00:00Z", "WH-B"),
+    ]
+    body2 = post(
+        [HIT, MISS1], [RULE_HIT], events2, contact_until="2026-09-01T01:00:00Z"
+    )
+    assert body2["contacts"] == []
+
+
+def test_contacts_container_transfer_carries_descendant():
+    # 命中件装入未命中托盘后随整托移动:与另一件未命中实物在 WH-B 共处
+    events = [
+        *ALL_AT_A,  # PALLET / CASE / ITEM 各自在 WH-A 首次交接
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        pack(CASE, ITEM, "2026-09-01T02:00:00Z"),
+        transfer(PALLET, "2026-09-01T03:00:00Z", "WH-B", from_loc="WH-A"),
+        # 未命中的 CASE 此时随容器在 WH-B;规则只命中 ITEM(GTIN3)
+    ]
+    body = post(
+        [PALLET, CASE, ITEM],
+        [rule("R1", gtin=GTIN3)],
+        events,
+        contact_until="2026-09-01T04:00:00Z",
+    )
+    rows = _contact_rows(body)
+    # CASE 与 ITEM:WH-A 段(装入后同在 A,随动前后都在同地)与 WH-B 段相接不合并(地点不同)
+    assert ("CASE", "ITEM", "WH-A", "2026-09-01T00:02:00Z", "2026-09-01T03:00:00Z") in rows
+    assert ("CASE", "ITEM", "WH-B", "2026-09-01T03:00:00Z", "2026-09-01T04:00:00Z") in rows
+    # PALLET 也与 ITEM 同地(直接配对,不做传递之外的推断)
+    assert ("PALLET", "ITEM", "WH-B", "2026-09-01T03:00:00Z", "2026-09-01T04:00:00Z") in rows
+
+
+def test_contacts_unpack_keeps_location():
+    events = [
+        *ALL_AT_A,
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        pack(CASE, ITEM, "2026-09-01T02:00:00Z"),
+        transfer(PALLET, "2026-09-01T03:00:00Z", "WH-B", from_loc="WH-A"),
+        unpack(CASE, ITEM, "2026-09-01T04:00:00Z"),  # 取出保留 WH-B
+    ]
+    body = post(
+        [PALLET, CASE, ITEM],
+        [rule("R1", gtin=GTIN3)],
+        events,
+        contact_until="2026-09-01T05:00:00Z",
+    )
+    # 取出后 ITEM 仍在 WH-B,与 PALLET(当前持有人 WH-B)继续同地,WH-B 时段相接合并
+    rows = [r for r in _contact_rows(body) if r[0] == "PALLET"]
+    assert rows == [
+        ("PALLET", "ITEM", "WH-A", "2026-09-01T00:02:00Z", "2026-09-01T03:00:00Z"),
+        ("PALLET", "ITEM", "WH-B", "2026-09-01T03:00:00Z", "2026-09-01T05:00:00Z"),
+    ]
+
+
+def test_contacts_no_transitive_spread_and_unknown_holder():
+    # HIT 在 WH-A 与 MISS1 共处;MISS1 随后到 WH-B 与从未命中的 MISS2 同地,
+    # MISS2 不得经 MISS1 与 HIT 产生共处
+    events = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS1, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS2, "2026-09-01T00:00:00Z", "WH-B"),
+        transfer(MISS1, "2026-09-01T01:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    body = post(
+        [HIT, MISS1, MISS2],
+        [RULE_HIT],
+        events,
+        contact_until="2026-09-01T02:00:00Z",
+    )
+    assert _contact_rows(body) == [
+        ("MISS1", "HIT", "WH-A", "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z")
+    ]
+
+    # MISS2 从未交接(持有人未知):即使 HIT 之后到达 WH-B 也不计
+    events2 = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(HIT, "2026-09-01T01:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    body2 = post(
+        [HIT, MISS2],
+        [RULE_HIT],
+        events2,
+        contact_until="2026-09-01T02:00:00Z",
+    )
+    assert body2["contacts"] == []
+
+
+def test_contacts_failed_events_have_no_effect():
+    events = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS1, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(HIT, "2026-09-01T01:00:00Z", "WH-X", from_loc="WH-Z"),  # 链断裂,失败
+    ]
+    body = post(
+        [HIT, MISS1], [RULE_HIT], events, contact_until="2026-09-01T02:00:00Z"
+    )
+    assert [e["index"] for e in body["errors"]] == [2]
+    # 失败不改变持有人,WH-A 共处连续并合并为一段
+    assert _contact_rows(body) == [
+        ("MISS1", "HIT", "WH-A", "2026-09-01T00:00:00Z", "2026-09-01T02:00:00Z")
+    ]
+
+
+def test_contacts_adjacent_merged_gap_kept_separate():
+    events = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS1, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(HIT, "2026-09-01T01:00:00Z", "WH-B", from_loc="WH-A"),
+        transfer(HIT, "2026-09-01T02:00:00Z", "WH-A", from_loc="WH-B"),  # 回到 A
+    ]
+    body = post(
+        [HIT, MISS1], [RULE_HIT], events, contact_until="2026-09-01T03:00:00Z"
+    )
+    # MISS1 一直在 WH-A:两段 [00,01) 与 [02,03) 不相接,不合并
+    assert _contact_rows(body) == [
+        ("MISS1", "HIT", "WH-A", "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z"),
+        ("MISS1", "HIT", "WH-A", "2026-09-01T02:00:00Z", "2026-09-01T03:00:00Z"),
+    ]
+
+
+def test_contacts_sorted_by_identities_start_location():
+    events = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS2, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS1, "2026-09-01T00:00:00Z", "WH-A"),
+    ]
+    body = post(
+        [HIT, MISS1, MISS2],
+        [RULE_HIT],
+        events,
+        contact_until="2026-09-01T01:00:00Z",
+    )
+    # 未命中实物身份排序:GTIN2/MISS1 在 GTIN4/MISS2 之前
+    assert [c["missed_item"]["serial"] for c in body["contacts"]] == ["MISS1", "MISS2"]
+    for c in body["contacts"]:
+        assert c["hit_item"] == {"gtin": GTIN3, "serial": "HIT"}
+
+
+def test_contacts_empty_when_no_co_location():
+    events = [
+        transfer(HIT, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(MISS1, "2026-09-01T00:00:00Z", "WH-B"),
+    ]
+    body = post(
+        [HIT, MISS1], [RULE_HIT], events, contact_until="2026-09-01T01:00:00Z"
+    )
+    assert body["contacts"] == []
+
+
 # ---------- 旧接口回归 ----------
-
-
 def test_existing_endpoints_still_available():
     assert client.get("/healthz").json() == {"status": "ok"}
     custody_event = {

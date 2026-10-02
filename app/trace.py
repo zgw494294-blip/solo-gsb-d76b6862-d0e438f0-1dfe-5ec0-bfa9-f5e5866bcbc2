@@ -25,10 +25,12 @@ from fastapi import HTTPException
 from .gs1 import ParsedScan, ScanParseError, parse_scan
 from .matcher import match_rules
 from .models import (
+    LocationTraceContact,
     LocationTraceEventError,
     LocationTraceItem,
     LocationTraceRequest,
     LocationTraceResponse,
+    TraceContactItem,
     TracePackingEvent,
     TraceTransferEvent,
 )
@@ -124,8 +126,36 @@ def _failure_reason(failure: ReplayFailure) -> str:
 
 
 def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
-    """重放交接 / 装拆事件,返回命中召回实物经过的地点与失败事件的原因。"""
+    """重放交接 / 装拆事件,返回命中召回实物经过的地点与失败事件的原因。
+
+    请求提供 contact_until 时,额外按时间片重放各库存实物的持有人,统计未命中
+    召回实物与直接命中实物的正时长同地共处时段(contacts)。
+    """
     inventory = parse_inventory(request.scans)
+
+    # 命中规则按库存身份预先分类(同时供 items 输出与共处统计使用)
+    hits_by_key: dict[ItemKey, list[str]] = {
+        key: match_rules(parsed, request.rules) for key, parsed in inventory.items()
+    }
+    hit_keys = {key for key, hits in hits_by_key.items() if hits}
+    missed_keys = set(inventory) - hit_keys
+
+    contact_until = (
+        request.contact_until.astimezone(timezone.utc)
+        if request.contact_until is not None
+        else None
+    )
+    if contact_until is not None:
+        latest_event = max(
+            (event.occurred_at.astimezone(timezone.utc) for event in request.events),
+        )
+        if contact_until < latest_event:
+            raise _unprocessable(
+                "contact_until 不得早于任何事件时间: "
+                f"最晚事件为 {latest_event.isoformat()},contact_until 为 "
+                f"{contact_until.isoformat()}"
+            )
+
     kernel = ReplayKernel(ReplayConfig.trace())
     nodes_meta: dict[ItemKey, ParsedScan] = {}
     for key, parsed in inventory.items():
@@ -137,6 +167,47 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
         range(len(request.events)),
         key=lambda i: (request.events[i].occurred_at.astimezone(timezone.utc), i),
     )
+
+    # 共处时段:键为 (未命中实物, 命中实物, 地点),值为该键当前打开的 [start, ?)
+    # 时段。时间片左闭右开;同一对 / 地点相接的时段最后做合并。
+    open_contacts: dict[tuple[ItemKey, ItemKey, str], datetime] = {}
+    closed_contacts: list[tuple[ItemKey, ItemKey, str, datetime, datetime]] = []
+
+    def close_open(key: tuple[ItemKey, ItemKey, str], end: datetime) -> None:
+        start = open_contacts.pop(key)
+        if end > start:  # 仅保留正时长时段
+            u, h, location = key
+            closed_contacts.append((u, h, location, start, end))
+
+    def evaluate_contacts(instant: datetime, is_last: bool) -> None:
+        """同刻事件全部提交后,以 instant 的状态计算接下来的时段。
+
+        is_last 表示这是最后一个事件时刻;其后状态不再变化,所有仍打开的时段
+        统一延伸至 contact_until 收尾。
+        """
+        # 先按 instant 的状态结算上一个打开时段:状态延续的键保持打开(时段相接),
+        # 其余(任一方持有人缺失 / 变更 / 不再同地)在此闭合。
+        holders = {key: node.holder for key, node in kernel.nodes.items()}
+        active: set[tuple[ItemKey, ItemKey, str]] = set()
+        for u in missed_keys:
+            holder_u = holders[u]
+            if holder_u is None:  # 持有人未知:不计共处
+                continue
+            for h in hit_keys:
+                holder_h = holders[h]
+                if holder_h is not None and holder_h == holder_u:
+                    active.add((u, h, holder_u))
+        for key in list(open_contacts):
+            if key not in active:
+                close_open(key, instant)
+        # 新出现的共处状态自 instant 起打开新时段
+        for key in active:
+            open_contacts.setdefault(key, instant)
+        # 最后一个事件时刻之后状态不再变化:打开时段延伸至 contact_until
+        if is_last:
+            assert contact_until is not None
+            for key in list(open_contacts):
+                close_open(key, contact_until)
 
     def parse_party(
         raw_scan: str, role: str, index: int
@@ -168,41 +239,60 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
             )
         return key, None
 
-    for index in order:
-        event = request.events[index]
+    # 按 UTC 时刻分组:同一时刻的事件依输入顺序全部处理后,才计算接下来的时段
+    cursor = 0
+    while cursor < len(order):
+        instant = request.events[order[cursor]].occurred_at.astimezone(timezone.utc)
+        group_end = cursor + 1
+        while group_end < len(order):
+            other = request.events[order[group_end]].occurred_at.astimezone(timezone.utc)
+            if other != instant:
+                break
+            group_end += 1
 
-        if isinstance(event, TraceTransferEvent):
-            key, err = parse_party(event.scan, "扫描", index)
-            if err is not None:
-                errors.append(LocationTraceEventError(index=index, reason=err))
-                continue
-            assert key is not None
-            failure = kernel.transfer(index, key, event.from_location, event.to_location)
-        else:
-            assert isinstance(event, TracePackingEvent)
-            parent_key, err = parse_party(event.parent_scan, "父件", index)
-            if err is not None:
-                errors.append(LocationTraceEventError(index=index, reason=err))
-                continue
-            child_key, err = parse_party(event.child_scan, "子件", index)
-            if err is not None:
-                errors.append(LocationTraceEventError(index=index, reason=err))
-                continue
-            assert parent_key is not None and child_key is not None
-            if event.action == "pack":
-                failure = kernel.pack(index, parent_key, child_key)
+        for pos in range(cursor, group_end):
+            index = order[pos]
+            event = request.events[index]
+
+            if isinstance(event, TraceTransferEvent):
+                key, err = parse_party(event.scan, "扫描", index)
+                if err is not None:
+                    errors.append(LocationTraceEventError(index=index, reason=err))
+                    continue
+                assert key is not None
+                failure = kernel.transfer(
+                    index, key, event.from_location, event.to_location
+                )
             else:
-                failure = kernel.unpack(index, parent_key, child_key)
+                assert isinstance(event, TracePackingEvent)
+                parent_key, err = parse_party(event.parent_scan, "父件", index)
+                if err is not None:
+                    errors.append(LocationTraceEventError(index=index, reason=err))
+                    continue
+                child_key, err = parse_party(event.child_scan, "子件", index)
+                if err is not None:
+                    errors.append(LocationTraceEventError(index=index, reason=err))
+                    continue
+                assert parent_key is not None and child_key is not None
+                if event.action == "pack":
+                    failure = kernel.pack(index, parent_key, child_key)
+                else:
+                    failure = kernel.unpack(index, parent_key, child_key)
 
-        if failure is not None:
-            errors.append(
-                LocationTraceEventError(index=index, reason=_failure_reason(failure))
-            )
+            if failure is not None:
+                errors.append(
+                    LocationTraceEventError(index=index, reason=_failure_reason(failure))
+                )
+
+        if contact_until is not None:
+            evaluate_contacts(instant, group_end == len(order))
+
+        cursor = group_end
 
     # 仅对命中召回的库存实物输出
     items: list[LocationTraceItem] = []
     for key, parsed in inventory.items():
-        hits = match_rules(parsed, request.rules)
+        hits = hits_by_key[key]
         if not hits:
             continue
         items.append(
@@ -215,4 +305,46 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
         )
     items.sort(key=lambda item: (item.gtin, item.serial))
     errors.sort(key=lambda error: error.index)
-    return LocationTraceResponse(items=items, errors=errors)
+
+    contacts: list[LocationTraceContact] | None = None
+    if contact_until is not None:
+        contacts = _merge_and_order_contacts(closed_contacts)
+    return LocationTraceResponse(items=items, errors=errors, contacts=contacts)
+
+
+def _merge_and_order_contacts(
+    intervals: list[tuple[ItemKey, ItemKey, str, datetime, datetime]],
+) -> list[LocationTraceContact]:
+    """合并同一实物对、地点的相接时段,并按要求排序输出。
+
+    同一 (未命中实物, 命中实物, 地点) 下的时段互不重叠;端点相接(end == 下一段
+    start)即合并为一段。随后按未命中实物身份、命中实物身份、开始时间、地点排序。
+    """
+    grouped: dict[tuple[ItemKey, ItemKey, str], list[tuple[datetime, datetime]]] = {}
+    for u, h, location, start, end in intervals:
+        grouped.setdefault((u, h, location), []).append((start, end))
+
+    merged: list[tuple[ItemKey, ItemKey, str, datetime, datetime]] = []
+    for (u, h, location), spans in grouped.items():
+        spans.sort()
+        cur_start, cur_end = spans[0]
+        for start, end in spans[1:]:
+            if start <= cur_end:  # 相接(正常状态延续)或重叠,合并
+                if end > cur_end:
+                    cur_end = end
+            else:
+                merged.append((u, h, location, cur_start, cur_end))
+                cur_start, cur_end = start, end
+        merged.append((u, h, location, cur_start, cur_end))
+
+    merged.sort(key=lambda row: (row[0][0], row[0][1], row[1][0], row[1][1], row[3], row[2]))
+    return [
+        LocationTraceContact(
+            missed_item=TraceContactItem(gtin=u[0], serial=u[1]),
+            hit_item=TraceContactItem(gtin=h[0], serial=h[1]),
+            location=location,
+            start_time=start,
+            end_time=end,
+        )
+        for u, h, location, start, end in merged
+    ]

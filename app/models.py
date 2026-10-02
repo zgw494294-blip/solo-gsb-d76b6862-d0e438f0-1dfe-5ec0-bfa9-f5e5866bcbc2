@@ -511,11 +511,20 @@ class LocationTraceRequest(BaseModel):
     scans: list[str] = Field(min_length=1, max_length=100)  # 库存扫描,须含 AI 21
     rules: list[Rule] = Field(min_length=1, max_length=100)  # 召回规则,同召回核验
     events: list[TraceEvent] = Field(min_length=1, max_length=200)  # 交接 / 装拆事件
+    # 可选:同地共处统计截止时间(带时区);省略时仅返回原追溯结果
+    contact_until: datetime | None = None
 
     @field_validator("rules")
     @classmethod
     def _rule_ids_unique(cls, v: list[Rule]) -> list[Rule]:
         return _ensure_unique_rule_ids(v)
+
+    @field_validator("contact_until")
+    @classmethod
+    def _contact_until_aware(cls, v: datetime | None) -> datetime | None:
+        if v is not None and (v.tzinfo is None or v.tzinfo.utcoffset(v) is None):
+            raise ValueError("contact_until 须带时区信息")
+        return v
 
 
 class LocationTraceItem(BaseModel):
@@ -532,6 +541,25 @@ class LocationTraceEventError(BaseModel):
     reason: str
 
 
+class TraceContactItem(BaseModel):
+    """共处实物一方的身份引用:GTIN + AI 21 序列号。"""
+
+    gtin: str
+    serial: str
+
+
+class LocationTraceContact(BaseModel):
+    """未命中实物与直接命中实物在同一保管地点的一段正时长共处(UTC,左闭右开)。"""
+
+    missed_item: TraceContactItem  # 未命中召回的库存实物
+    hit_item: TraceContactItem  # 直接命中召回的库存实物
+    location: str  # 共处的保管地点(双方当时的共同持有人)
+    start_time: datetime  # UTC 起(含)
+    end_time: datetime  # UTC 止(不含)
+
+
 class LocationTraceResponse(BaseModel):
     items: list[LocationTraceItem]  # 仅含命中召回的库存实物,按 GTIN、序列号排序
     errors: list[LocationTraceEventError]  # 事件错误,按原始下标排序
+    # 仅当请求提供 contact_until 时出现:未命中实物与命中实物的同地共处时段
+    contacts: list[LocationTraceContact] | None = None
