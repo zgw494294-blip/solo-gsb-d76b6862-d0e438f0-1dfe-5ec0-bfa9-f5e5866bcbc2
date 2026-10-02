@@ -1,0 +1,11 @@
+{
+  "keys": [
+    {
+      "kid": "recall-key-001",
+      "public_key": "eVSJFlXQrYet1h_6kvGijdFaPqD0pJItCcQi7a2QS2U",
+      "gtin_prefixes": [
+        "0950600"
+      ]
+    }
+  ]
+}

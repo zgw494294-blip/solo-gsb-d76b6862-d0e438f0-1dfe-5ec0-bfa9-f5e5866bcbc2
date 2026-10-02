@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    image: gs1-recall-check:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内本地信任文件路径(由下方只读目录挂载提供)
+      RECALL_TRUST_FILE: /srv/trust/recall-keys.json
+      # 容器内单包撤销名单路径(由下方只读目录挂载提供);
+      # 宿主机原子替换该文件后,下一次请求即生效,无需重启容器
+      RECALL_REVOKED_FILE: /srv/trust/revoked-packages.json
+    volumes:
+      # 整个信任目录只读挂载(而非逐个文件绑定):
+      # 单文件绑定会钉死宿主机的 inode,宿主机 os.replace/rename 原子替换后,
+      # 容器内仍指向旧 inode 而读到旧内容;绑定目录时容器按路径名重新解析,
+      # 原子替换后立即看到新 inode。trust/ 目录内只放可暴露给容器的信任文件
+      # (样例私钥在 examples/,不在此目录)。
+      - ./trust:/srv/trust:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

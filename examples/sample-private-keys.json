@@ -1,0 +1,9 @@
+{
+  "warning": "本地样例私钥,切勿用于生产;服务端不读取本文件",
+  "keys": [
+    {
+      "kid": "recall-key-001",
+      "private_key": "V8JmbYHUg_wvqVHbKqeI58fZV7ImNTHtplqOc5MYWw0"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+fastapi==0.141.1
+pydantic==2.13.5
+uvicorn[standard]==0.54.0
+cryptography==46.0.3
