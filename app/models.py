@@ -504,6 +504,8 @@ class LocationTraceRequest(BaseModel):
 
     库存扫描须全部合法、含 AI 21 且 GTIN+序列号唯一,否则整个请求返回 422;
     事件扫描的合法性、库存引用与批号 / 有效期一致性按事件原下标报错,不生效。
+    可选 contact_until(带时区):提供时须不早于任何事件时间,否则 422;
+    提供后响应额外附带未命中实物与直接命中实物的同地共处时段 contacts。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -511,11 +513,30 @@ class LocationTraceRequest(BaseModel):
     scans: list[str] = Field(min_length=1, max_length=100)  # 库存扫描,须含 AI 21
     rules: list[Rule] = Field(min_length=1, max_length=100)  # 召回规则,同召回核验
     events: list[TraceEvent] = Field(min_length=1, max_length=200)  # 交接 / 装拆事件
+    contact_until: datetime | None = None  # 可选:共处时段观察窗口的截止时刻(带时区)
 
     @field_validator("rules")
     @classmethod
     def _rule_ids_unique(cls, v: list[Rule]) -> list[Rule]:
         return _ensure_unique_rule_ids(v)
+
+    @field_validator("contact_until")
+    @classmethod
+    def _contact_until_aware(cls, v: datetime | None) -> datetime | None:
+        if v is not None and (v.tzinfo is None or v.tzinfo.utcoffset(v) is None):
+            raise ValueError("contact_until 须带时区信息")
+        return v
+
+    @model_validator(mode="after")
+    def _contact_until_not_before_events(self) -> "LocationTraceRequest":
+        if self.contact_until is not None:
+            latest = max(event.occurred_at for event in self.events)
+            if self.contact_until < latest:
+                raise ValueError(
+                    "contact_until 不得早于任何事件时间"
+                    f"(最晚事件时间为 {latest.isoformat()})"
+                )
+        return self
 
 
 class LocationTraceItem(BaseModel):
@@ -532,6 +553,18 @@ class LocationTraceEventError(BaseModel):
     reason: str
 
 
+class LocationTraceContact(BaseModel):
+    """一段未命中实物与直接命中实物在同一保管地点的正时长共处(左闭右开,UTC)。"""
+
+    item: PackingItemRef  # 未命中召回的库存实物
+    recalled_item: PackingItemRef  # 直接命中召回的库存实物
+    location: str  # 共处地点(双方当时的共同持有人)
+    start: datetime  # 共处开始时刻(含),UTC
+    end: datetime  # 共处结束时刻(不含),UTC
+
+
 class LocationTraceResponse(BaseModel):
     items: list[LocationTraceItem]  # 仅含命中召回的库存实物,按 GTIN、序列号排序
     errors: list[LocationTraceEventError]  # 事件错误,按原始下标排序
+    # 仅在请求提供 contact_until 时返回(无共处为空数组);省略时响应与原有一致
+    contacts: list[LocationTraceContact] | None = None

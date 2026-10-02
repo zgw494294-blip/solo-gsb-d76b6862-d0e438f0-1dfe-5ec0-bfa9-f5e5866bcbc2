@@ -2,6 +2,7 @@
 
 from fastapi.testclient import TestClient
 
+from app.gs1 import parse_scan
 from app.main import app
 
 client = TestClient(app)
@@ -554,9 +555,283 @@ def test_event_errors_sorted_by_original_index():
     assert [e["index"] for e in body["errors"]] == [0, 1, 2]
 
 
+# ---------- 同地共处时段(contact_until)----------
+
+RECALLED = scan(GTIN, "R1")  # 命中召回
+UNRECALLED = scan(GTIN2, "U1")  # 未命中召回
+UNTIL = "2026-09-01T06:00:00Z"
+
+
+def post_contacts(scans, rules, events, until=UNTIL, expected=200):
+    resp = client.post(
+        "/v1/recall/location-trace",
+        json={"scans": scans, "rules": rules, "events": events, "contact_until": until},
+    )
+    assert resp.status_code == expected, resp.text
+    return resp.json()
+
+
+def contact(item_key, recalled_key, location, start, end):
+    """构造期望的 contacts 条目(双方均为 (GTIN, 序列号))。"""
+    return {
+        "item": {"gtin": item_key[0], "serial": item_key[1]},
+        "recalled_item": {"gtin": recalled_key[0], "serial": recalled_key[1]},
+        "location": location,
+        "start": start,
+        "end": end,
+    }
+
+
+def key_of(sc):
+    """从扫描串取 (GTIN, 序列号),便于断言。"""
+    parsed = parse_scan(sc)
+    return parsed.gtin, parsed.serial
+
+
+def test_contact_until_omitted_response_has_no_contacts_key():
+    events = [transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A")]
+    body = post([RECALLED, UNRECALLED], [rule("R1")], events)
+    assert "contacts" not in body  # 省略时响应与原有一致
+
+
+def test_contact_until_must_be_timezone_aware():
+    resp = client.post(
+        "/v1/recall/location-trace",
+        json={
+            "scans": [RECALLED],
+            "rules": [rule("R1")],
+            "events": [transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A")],
+            "contact_until": "2026-09-01T06:00:00",  # 缺时区
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_contact_until_must_not_precede_any_event():
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(RECALLED, "2026-09-01T02:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    # 早于最晚事件(即使晚于最早事件)也须 422
+    post_contacts([RECALLED], [rule("R1")], events, until="2026-09-01T01:00:00Z", expected=422)
+    post_contacts([RECALLED], [rule("R1")], events, until="2026-08-31T23:00:00Z", expected=422)
+    # 等于最晚事件时刻合法
+    body = post_contacts([RECALLED], [rule("R1")], events, until="2026-09-01T02:00:00Z")
+    assert body["contacts"] == []
+
+
+def test_contact_until_accepts_non_utc_timezone():
+    events = [transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+              transfer(UNRECALLED, "2026-09-01T00:10:00Z", "WH-A")]
+    body = post_contacts(
+        [RECALLED, UNRECALLED], [rule("R1")], events, until="2026-09-01T14:00:00+08:00"
+    )
+    assert body["contacts"] == [
+        contact(key_of(UNRECALLED), key_of(RECALLED), "WH-A",
+                "2026-09-01T00:10:00Z", "2026-09-01T06:00:00Z")
+    ]
+
+
+def test_contacts_basic_colocation_and_window_end():
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(UNRECALLED, "2026-09-01T00:30:00Z", "WH-A"),
+        transfer(RECALLED, "2026-09-01T02:00:00Z", "WH-B", from_loc="WH-A"),
+        transfer(UNRECALLED, "2026-09-01T03:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    body = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events, until="2026-09-01T05:00:00Z")
+    assert body["errors"] == []
+    assert body["contacts"] == [
+        contact(key_of(UNRECALLED), key_of(RECALLED), "WH-A",
+                "2026-09-01T00:30:00Z", "2026-09-01T02:00:00Z"),
+        contact(key_of(UNRECALLED), key_of(RECALLED), "WH-B",
+                "2026-09-01T03:00:00Z", "2026-09-01T05:00:00Z"),
+    ]
+    # 原结果保留:命中实物的地点列表不变
+    assert body["items"] == [
+        {"gtin": GTIN, "serial": "R1", "locations": ["WH-A", "WH-B"], "rule_ids": ["R1"]}
+    ]
+
+
+def test_contacts_same_instant_events_processed_before_interval():
+    # 同一时刻两条事件全部处理完后才计算接下来时段:共处从该时刻开始
+    events = [
+        transfer(UNRECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+    ]
+    body = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events,
+                         until="2026-09-01T01:00:00Z")
+    assert body["contacts"] == [
+        contact(key_of(UNRECALLED), key_of(RECALLED), "WH-A",
+                "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z")
+    ]
+    # 同刻离开 + 到达:以整组处理完后的状态计,不产生共处
+    events2 = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(RECALLED, "2026-09-01T01:00:00Z", "WH-B", from_loc="WH-A"),
+        transfer(UNRECALLED, "2026-09-01T01:00:00Z", "WH-A"),
+    ]
+    body2 = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events2,
+                          until="2026-09-01T02:00:00Z")
+    assert body2["contacts"] == []
+
+
+def test_contacts_container_transfer_moves_descendants():
+    # PALLET、CASE 未命中,ITEM 命中;容器交接带动后代,共处地点随之变化
+    events = [
+        *ALL_AT_A,
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        pack(CASE, ITEM, "2026-09-01T02:00:00Z"),
+        transfer(PALLET, "2026-09-01T03:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    body = post_contacts([PALLET, CASE, ITEM], [rule("R1", gtin=GTIN3)], events,
+                         until="2026-09-01T04:00:00Z")
+    pallet, case, item = key_of(PALLET), key_of(CASE), key_of(ITEM)
+    assert body["contacts"] == [
+        contact(pallet, item, "WH-A", "2026-09-01T00:02:00Z", "2026-09-01T03:00:00Z"),
+        contact(pallet, item, "WH-B", "2026-09-01T03:00:00Z", "2026-09-01T04:00:00Z"),
+        contact(case, item, "WH-A", "2026-09-01T00:02:00Z", "2026-09-01T03:00:00Z"),
+        contact(case, item, "WH-B", "2026-09-01T03:00:00Z", "2026-09-01T04:00:00Z"),
+    ]
+
+
+def test_contacts_unpack_keeps_holder_and_merges_adjacent():
+    # 取出保留持有人:unpack 不改变共处;相接时段(跨 pack/unpack/无关事件)合并
+    events = [
+        *ALL_AT_A,
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        pack(CASE, ITEM, "2026-09-01T02:00:00Z"),
+        unpack(CASE, ITEM, "2026-09-01T03:00:00Z"),  # 取出后 ITEM 仍持有 WH-A
+    ]
+    body = post_contacts([PALLET, CASE, ITEM], [rule("R1", gtin=GTIN3)], events,
+                         until="2026-09-01T04:00:00Z")
+    pallet, case, item = key_of(PALLET), key_of(CASE), key_of(ITEM)
+    assert body["contacts"] == [
+        contact(pallet, item, "WH-A", "2026-09-01T00:02:00Z", "2026-09-01T04:00:00Z"),
+        contact(case, item, "WH-A", "2026-09-01T00:02:00Z", "2026-09-01T04:00:00Z"),
+    ]
+
+
+def test_contacts_unknown_holder_not_counted():
+    # 未命中实物从未成功交接(持有人未知),不计共处
+    events = [transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A")]
+    body = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events)
+    assert body["contacts"] == []
+
+
+def test_contacts_only_unmatched_vs_recalled_no_transitive():
+    other_recalled = scan(GTIN, "R2")  # 同 GTIN,同样命中
+    bystander = scan(GTIN3, "U2")  # 未命中,只与未命中实物共处
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(other_recalled, "2026-09-01T00:05:00Z", "WH-A"),  # 命中 × 命中不列
+        transfer(UNRECALLED, "2026-09-01T00:10:00Z", "WH-A"),
+        transfer(RECALLED, "2026-09-01T01:00:00Z", "WH-B", from_loc="WH-A"),
+        transfer(other_recalled, "2026-09-01T01:05:00Z", "WH-B", from_loc="WH-A"),
+        transfer(bystander, "2026-09-01T02:00:00Z", "WH-A"),  # 仅与未命中的 U1 共处
+    ]
+    body = post_contacts(
+        [RECALLED, other_recalled, UNRECALLED, bystander], [rule("R1")], events,
+        until="2026-09-01T03:00:00Z",
+    )
+    u1, r1, r2 = key_of(UNRECALLED), key_of(RECALLED), key_of(other_recalled)
+    # 不作传递扩散:bystander 不因与 U1 共处而关联到命中实物
+    assert body["contacts"] == [
+        contact(u1, r1, "WH-A", "2026-09-01T00:10:00Z", "2026-09-01T01:00:00Z"),
+        contact(u1, r2, "WH-A", "2026-09-01T00:10:00Z", "2026-09-01T01:05:00Z"),
+    ]
+
+
+def test_contacts_merge_across_unrelated_events_and_split_on_gap():
+    extra = scan(GTIN4, "X1")  # 未命中,独自在 WH-Z
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(UNRECALLED, "2026-09-01T00:10:00Z", "WH-A"),
+        transfer(extra, "2026-09-01T00:20:00Z", "WH-Z"),  # 无关事件不打断共处
+        transfer(UNRECALLED, "2026-09-01T00:30:00Z", "WH-B", from_loc="WH-A"),
+        transfer(UNRECALLED, "2026-09-01T00:40:00Z", "WH-A", from_loc="WH-B"),
+    ]
+    body = post_contacts([RECALLED, UNRECALLED, extra], [rule("R1")], events,
+                         until="2026-09-01T01:00:00Z")
+    u1, r1 = key_of(UNRECALLED), key_of(RECALLED)
+    # 离开再回来:两段不相接,分别列出;中间跨无关事件的时段合并
+    assert body["contacts"] == [
+        contact(u1, r1, "WH-A", "2026-09-01T00:10:00Z", "2026-09-01T00:30:00Z"),
+        contact(u1, r1, "WH-A", "2026-09-01T00:40:00Z", "2026-09-01T01:00:00Z"),
+    ]
+
+
+def test_contacts_positive_duration_only():
+    # contact_until 等于最后事件时刻:最后一段零时长,不产生共处
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(UNRECALLED, "2026-09-01T01:00:00Z", "WH-A"),
+    ]
+    body = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events,
+                         until="2026-09-01T01:00:00Z")
+    assert body["contacts"] == []
+
+
+def test_contacts_failed_events_not_effective():
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(UNRECALLED, "2026-09-01T00:10:00Z", "WH-A", from_loc="WH-X"),  # 失败
+        transfer(UNRECALLED, "2026-09-01T00:20:00Z", "WH-A"),  # 首次成功交接
+    ]
+    body = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events,
+                         until="2026-09-01T01:00:00Z")
+    assert [e["index"] for e in body["errors"]] == [1]
+    assert body["contacts"] == [
+        contact(key_of(UNRECALLED), key_of(RECALLED), "WH-A",
+                "2026-09-01T00:20:00Z", "2026-09-01T01:00:00Z")
+    ]
+
+
+def test_contacts_sorted_by_item_recalled_start_location():
+    ub = scan(GTIN2, "B")  # 未命中,GTIN2 < GTIN3
+    ua = scan(GTIN3, "A")  # 未命中
+    r1 = scan(GTIN, "R1")
+    r2 = scan(GTIN, "R2")  # 同 GTIN 也命中,序列号 R1 < R2
+    events = [
+        transfer(r2, "2026-09-01T00:00:00Z", "L2"),
+        transfer(ua, "2026-09-01T00:05:00Z", "L2"),
+        transfer(r1, "2026-09-01T00:10:00Z", "L1"),
+        transfer(ub, "2026-09-01T00:15:00Z", "L1"),
+        transfer(ua, "2026-09-01T00:20:00Z", "L1", from_loc="L2"),
+    ]
+    body = post_contacts([r1, r2, ua, ub], [rule("R1")], events,
+                         until="2026-09-01T01:00:00Z")
+    assert body["contacts"] == [
+        contact(key_of(ub), key_of(r1), "L1", "2026-09-01T00:15:00Z", "2026-09-01T01:00:00Z"),
+        contact(key_of(ua), key_of(r1), "L1", "2026-09-01T00:20:00Z", "2026-09-01T01:00:00Z"),
+        contact(key_of(ua), key_of(r2), "L2", "2026-09-01T00:05:00Z", "2026-09-01T00:20:00Z"),
+    ]
+
+
+def test_contacts_empty_array_when_no_colocation():
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(UNRECALLED, "2026-09-01T00:10:00Z", "WH-B"),
+    ]
+    body = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events)
+    assert body["contacts"] == []  # 提供 contact_until 但无共处:空数组而非缺省
+
+
+def test_contacts_items_and_errors_unchanged_with_contact_until():
+    events = [
+        transfer(RECALLED, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(UNRECALLED, "2026-09-01T00:10:00Z", "WH-A", from_loc="WH-X"),  # 失败
+        transfer(UNRECALLED, "2026-09-01T00:20:00Z", "WH-A"),
+        transfer(RECALLED, "2026-09-01T01:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    plain = post([RECALLED, UNRECALLED], [rule("R1")], events)
+    full = post_contacts([RECALLED, UNRECALLED], [rule("R1")], events)
+    assert full["items"] == plain["items"]
+    assert full["errors"] == plain["errors"]
+    assert "contacts" in full and "contacts" not in plain
+
+
 # ---------- 旧接口回归 ----------
-
-
 def test_existing_endpoints_still_available():
     assert client.get("/healthz").json() == {"status": "ok"}
     custody_event = {

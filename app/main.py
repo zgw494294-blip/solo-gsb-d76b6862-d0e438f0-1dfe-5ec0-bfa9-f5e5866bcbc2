@@ -36,8 +36,8 @@ from .trim import trim_custody
 
 app = FastAPI(
     title="GS1 扫码核验 API",
-    version="1.10.0",
-    summary="解析 GS1 扫描串(AI 01/10/17/21):召回规则匹配、EdDSA 签名核验与单包撤销、规则关系分析、实物交接重放、交接日志最少剔除、装拆包装审计、召回隔离计划、召回实物地点追溯与到货核对",
+    version="1.11.0",
+    summary="解析 GS1 扫描串(AI 01/10/17/21):召回规则匹配、EdDSA 签名核验与单包撤销、规则关系分析、实物交接重放、交接日志最少剔除、装拆包装审计、召回隔离计划、召回实物地点追溯(含未命中实物同地共处时段)与到货核对",
 )
 
 
@@ -109,8 +109,13 @@ def receiving_reconcile(
 @app.post(
     "/v1/recall/location-trace",
     response_model=LocationTraceResponse,
+    # 省略 contact_until 时 contacts 为 None,响应须与原有一致(不输出该字段)
+    response_model_exclude_none=True,
     tags=["recall"],
 )
 def recall_location_trace(request: LocationTraceRequest) -> LocationTraceResponse:
-    """重放交接 / 装拆事件,追溯命中召回实物按首次到达顺序去重的保管地点。"""
+    """重放交接 / 装拆事件,追溯命中召回实物按首次到达顺序去重的保管地点。
+
+    提供可选 contact_until 时,额外返回未命中实物与直接命中实物的同地共处时段。
+    """
     return trace_locations(request)

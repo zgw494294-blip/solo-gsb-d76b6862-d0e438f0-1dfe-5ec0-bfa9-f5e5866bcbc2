@@ -14,21 +14,29 @@
 - 取出(unpack)须为当前直接父子关系,取出后子件保留当时持有人(不重复记地点)。
 
 失败事件由内核保证不留下任何半次更新,后续事件继续从失败前状态处理。
+
+可选 contact_until:提供时,同一 UTC 时刻的事件全部处理完后才以其后状态计算
+接下来时段的持有人;时段左闭右开、截止 contact_until,据此找出**未命中召回**
+的库存实物与**直接命中**实物在同一保管地点(共同持有人)的正时长共处时段,
+同一实物对、地点的相接时段合并,结果附在响应 contacts 中(省略 contact_until
+时响应与原有一致,不含 contacts)。
 """
 
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
 from .gs1 import ParsedScan, ScanParseError, parse_scan
 from .matcher import match_rules
 from .models import (
+    LocationTraceContact,
     LocationTraceEventError,
     LocationTraceItem,
     LocationTraceRequest,
     LocationTraceResponse,
+    PackingItemRef,
     TracePackingEvent,
     TraceTransferEvent,
 )
@@ -123,8 +131,72 @@ def _failure_reason(failure: ReplayFailure) -> str:
     return failure.detail or "事件失败"
 
 
+def _snapshot_holders(
+    kernel: ReplayKernel, inventory: dict[ItemKey, ParsedScan]
+) -> dict[ItemKey, str | None]:
+    """记录当前每件库存实物的持有人(None 表示尚无成功交接,不计入共处)。"""
+    return {key: kernel.nodes[key].holder for key in inventory}
+
+
+def _compute_contacts(
+    intervals: list[tuple[datetime, datetime, dict[ItemKey, str | None]]],
+    recalled: set[ItemKey],
+) -> list[LocationTraceContact]:
+    """由逐时段持有人快照计算未命中 × 直接命中实物的同地共处时段。
+
+    仅统计正时长时段的同地共处(共同持有人),不作传递扩散;持有人未知不计;
+    同一实物对、地点的相接时段合并;结果按未命中实物身份、命中实物身份、
+    开始时间、地点排序。
+    """
+    # (未命中实物, 命中实物, 地点) -> 当前未闭合的共处时段 [start, end]
+    ongoing: dict[tuple[ItemKey, ItemKey, str], list[datetime]] = {}
+    closed: list[tuple[ItemKey, ItemKey, str, datetime, datetime]] = []
+
+    for start, end, holders in intervals:
+        if end <= start:
+            continue  # 零时长时段(contact_until 等于最后事件时刻时)不产生共处
+        by_location: dict[str, list[ItemKey]] = {}
+        for key, holder in holders.items():
+            if holder is not None:  # 持有人未知不计
+                by_location.setdefault(holder, []).append(key)
+        active: set[tuple[ItemKey, ItemKey, str]] = set()
+        for location, keys in by_location.items():
+            unmatched_here = [key for key in keys if key not in recalled]
+            recalled_here = [key for key in keys if key in recalled]
+            for item_key in unmatched_here:
+                for recalled_key in recalled_here:
+                    active.add((item_key, recalled_key, location))
+        for triple in active:
+            span = ongoing.get(triple)
+            if span is None:
+                ongoing[triple] = [start, end]
+            else:
+                span[1] = end  # 与上一时段相接,合并
+        for triple in [t for t in ongoing if t not in active]:
+            span_start, span_end = ongoing.pop(triple)
+            closed.append((*triple, span_start, span_end))
+    for triple, (span_start, span_end) in ongoing.items():
+        closed.append((*triple, span_start, span_end))
+
+    closed.sort(key=lambda row: (row[0], row[1], row[3], row[2]))
+    return [
+        LocationTraceContact(
+            item=PackingItemRef(gtin=item_key[0], serial=item_key[1]),
+            recalled_item=PackingItemRef(gtin=recalled_key[0], serial=recalled_key[1]),
+            location=location,
+            start=span_start,
+            end=span_end,
+        )
+        for item_key, recalled_key, location, span_start, span_end in closed
+    ]
+
+
 def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
-    """重放交接 / 装拆事件,返回命中召回实物经过的地点与失败事件的原因。"""
+    """重放交接 / 装拆事件,返回命中召回实物经过的地点与失败事件的原因。
+
+    提供 contact_until 时,额外按同刻分组的持有人快照计算未命中实物与直接
+    命中实物的同地共处时段,附在响应 contacts 中。
+    """
     inventory = parse_inventory(request.scans)
     kernel = ReplayKernel(ReplayConfig.trace())
     nodes_meta: dict[ItemKey, ParsedScan] = {}
@@ -168,8 +240,27 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
             )
         return key, None
 
+    # 提供 contact_until 时,同一 UTC 时刻的事件全部处理完后才记录持有人快照:
+    # 时段 [上一时刻, 下一时刻) 的持有人取上一组处理完后的状态,最后一段截止
+    # contact_until;时段左闭右开
+    contact_until = (
+        request.contact_until.astimezone(timezone.utc)
+        if request.contact_until is not None
+        else None
+    )
+    intervals: list[tuple[datetime, datetime, dict[ItemKey, str | None]]] = []
+    prev_instant: datetime | None = None
+
     for index in order:
         event = request.events[index]
+
+        if contact_until is not None:
+            instant = event.occurred_at.astimezone(timezone.utc)
+            if prev_instant is not None and instant != prev_instant:
+                intervals.append(
+                    (prev_instant, instant, _snapshot_holders(kernel, inventory))
+                )
+            prev_instant = instant
 
         if isinstance(event, TraceTransferEvent):
             key, err = parse_party(event.scan, "扫描", index)
@@ -199,10 +290,20 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
                 LocationTraceEventError(index=index, reason=_failure_reason(failure))
             )
 
+    if contact_until is not None:
+        assert prev_instant is not None  # events 至少一条
+        intervals.append(
+            (prev_instant, contact_until, _snapshot_holders(kernel, inventory))
+        )
+
+    hits_by_key = {
+        key: match_rules(parsed, request.rules) for key, parsed in inventory.items()
+    }
+
     # 仅对命中召回的库存实物输出
     items: list[LocationTraceItem] = []
     for key, parsed in inventory.items():
-        hits = match_rules(parsed, request.rules)
+        hits = hits_by_key[key]
         if not hits:
             continue
         items.append(
@@ -215,4 +316,10 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
         )
     items.sort(key=lambda item: (item.gtin, item.serial))
     errors.sort(key=lambda error: error.index)
-    return LocationTraceResponse(items=items, errors=errors)
+
+    contacts = None
+    if contact_until is not None:
+        recalled = {key for key, hits in hits_by_key.items() if hits}
+        contacts = _compute_contacts(intervals, recalled)
+
+    return LocationTraceResponse(items=items, errors=errors, contacts=contacts)
